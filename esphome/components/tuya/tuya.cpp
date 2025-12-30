@@ -75,67 +75,57 @@ void Tuya::dump_config() {
 }
 
 bool Tuya::validate_message_() {
-  uint32_t at = this->rx_message_.size() - 1;
-  auto *data = &this->rx_message_[0];
-  uint8_t new_byte = data[at];
+  uint32_t at = this->rx_message_.size();
+  if (at < 6)
+    return false;
 
-  // Byte 0: HEADER1 (always 0x55)
-  if (at == 0)
-    return new_byte == 0x55;
-  // Byte 1: HEADER2 (always 0xAA)
-  if (at == 1)
-    return new_byte == 0xAA;
+  // Copying to a temp buffer or accessing elements individually is safer with deque
+  uint16_t length = (uint16_t(this->rx_message_[4]) << 8) | (uint16_t(this->rx_message_[5]));
+  uint32_t total_size = 6 + length + 1;
 
-  // Byte 2: VERSION
-  // no validation for the following fields:
-  uint8_t version = data[2];
-  if (at == 2)
-    return true;
-  // Byte 3: COMMAND
-  uint8_t command = data[3];
-  if (at == 3)
-    return true;
+  if (at < total_size)
+    return false;
 
-  // Byte 4: LENGTH1
-  // Byte 5: LENGTH2
-  if (at <= 5) {
-    // no validation for these fields
-    return true;
+  // Verify Checksum
+  uint8_t rx_checksum = this->rx_message_[total_size - 1];
+  uint8_t calc_checksum = 0;
+  for (uint32_t i = 0; i < total_size - 1; i++) {
+    calc_checksum += this->rx_message_[i];
   }
 
-  uint16_t length = (uint16_t(data[4]) << 8) | (uint16_t(data[5]));
-
-  // wait until all data is read
-  if (at - 6 < length)
-    return true;
-
-  // Byte 6+LEN: CHECKSUM - sum of all bytes (including header) modulo 256
-  uint8_t rx_checksum = new_byte;
-  uint8_t calc_checksum = 0;
-  for (uint32_t i = 0; i < 6 + length; i++)
-    calc_checksum += data[i];
-
   if (rx_checksum != calc_checksum) {
-    ESP_LOGW(TAG, "Tuya Received invalid message checksum %02X!=%02X", rx_checksum, calc_checksum);
+    ESP_LOGE(TAG, "Tuya Checksum Fail");
+    this->rx_message_.clear();
     return false;
   }
 
-  // valid message
-  const uint8_t *message_data = data + 6;
-  ESP_LOGV(TAG, "Received Tuya: CMD=0x%02X VERSION=%u DATA=[%s] INIT_STATE=%u", command, version,
-           format_hex_pretty(message_data, length).c_str(), static_cast<uint8_t>(this->init_state_));
-  this->handle_command_(command, version, message_data, length);
+  // Extract payload for processing
+  std::vector<uint8_t> payload;
+  for (uint32_t i = 6; i < 6 + length; i++) {
+    payload.push_back(this->rx_message_[i]);
+  }
 
-  // return false to reset rx buffer
-  return false;
+  this->handle_command_(this->rx_message_[3], this->rx_message_[2], payload.data(), length);
+
+  // Surgical erase using deque's efficient iterator-based erase
+  this->rx_message_.erase(this->rx_message_.begin(), this->rx_message_.begin() + total_size);
+
+  return true;
 }
 
 void Tuya::handle_char_(uint8_t c) {
   this->rx_message_.push_back(c);
-  if (!this->validate_message_()) {
-    this->rx_message_.clear();
-  } else {
-    this->last_rx_char_timestamp_ = millis();
+  this->last_rx_char_timestamp_ = millis();
+
+  while (this->rx_message_.size() >= 2) {
+    if (this->rx_message_[0] == 0x55 && this->rx_message_[1] == 0xAA) {
+      if (!this->validate_message_()) {
+        break;
+      }
+    } else {
+      // Deque handles pop_front much faster than vector erase
+      this->rx_message_.pop_front();
+    }
   }
 }
 
@@ -477,30 +467,47 @@ void Tuya::process_command_queue_() {
   uint32_t now = millis();
   uint32_t delay = now - this->last_command_timestamp_;
 
-  if (now - this->last_rx_char_timestamp_ > RECEIVE_TIMEOUT) {
+  // Adaptive timeout: Passive MCUs need more time (1500ms) during initialization
+  uint32_t current_timeout = (this->init_state_ == TuyaInitState::INIT_DONE) ? 500 : 1500;
+
+  // 1. Buffer Cleanup: Flush stale noise or incomplete frames
+  if (!this->rx_message_.empty() && (now - this->last_rx_char_timestamp_ > current_timeout)) {
     this->rx_message_.clear();
   }
 
-  if (this->expected_response_.has_value() && delay > RECEIVE_TIMEOUT) {
+  // 2. Expectation Gate: Handle missing responses and retries
+  if (this->expected_response_.has_value() && delay > current_timeout) {
+    uint8_t timed_out_cmd = static_cast<uint8_t>(this->expected_response_.value());
+    ESP_LOGW(TAG, "Gate Timeout: No response for 0x%02X within %ums", timed_out_cmd, current_timeout);
+
     this->expected_response_.reset();
-    if (init_state_ != TuyaInitState::INIT_DONE) {
+
+    if (this->init_state_ != TuyaInitState::INIT_DONE) {
       if (++this->init_retries_ >= MAX_RETRIES) {
         this->init_failed_ = true;
-        ESP_LOGE(TAG, "Initialization failed at init_state %u", static_cast<uint8_t>(this->init_state_));
-        this->command_queue_.erase(command_queue_.begin());
+        ESP_LOGE(TAG, "Infrastructure: Critical stall at init_state %u", static_cast<uint8_t>(this->init_state_));
+        if (!this->command_queue_.empty())
+          this->command_queue_.pop_front();
         this->init_retries_ = 0;
       }
     } else {
-      this->command_queue_.erase(command_queue_.begin());
+      if (!this->command_queue_.empty())
+        this->command_queue_.pop_front();
     }
   }
 
-  // Left check of delay since last command in case there's ever a command sent by calling send_raw_command_ directly
-  if (delay > COMMAND_DELAY && !this->command_queue_.empty() && this->rx_message_.empty() &&
-      !this->expected_response_.has_value()) {
-    this->send_raw_command_(command_queue_.front());
-    if (!this->expected_response_.has_value())
-      this->command_queue_.erase(command_queue_.begin());
+  // 3. Transmission: Send next command if the link is clear
+  if (!this->command_queue_.empty() && !this->expected_response_.has_value()) {
+    if (delay <= COMMAND_DELAY)
+      return;
+    if (!this->rx_message_.empty())
+      return;  // Don't interrupt incoming data
+
+    this->send_raw_command_(this->command_queue_.front());
+
+    if (!this->expected_response_.has_value()) {
+      this->command_queue_.pop_front();
+    }
   }
 }
 
